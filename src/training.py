@@ -1,20 +1,29 @@
 import pandas as pd
 import numpy as np
+import os
+import sys
+import warnings
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from xgboost import XGBRegressor
+from statsmodels.tsa.arima.model import ARIMA
 from sqlalchemy import text
 from datetime import timedelta
-import sys
-import os
 
-# Brújula para imports
+# --- 0. Configuración y Brújula ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from config.db import get_db_engine
 
-# --- 1. FUNCIONES DE INDICADORES TÉCNICOS (Copiadas de tu script) ---
+warnings.filterwarnings('ignore', 'statsmodels.tsa.arima.model.ARIMA', UserWarning)
+VALIDATION_SET_SIZE = 0.2
+MIN_SAMPLES = 50 # Mínimo absoluto para que el entrenamiento sea viable
+
+# --- 1. FUNCIONES AUXILIARES ---
 def calculate_rsi(series, window=14):
+    """Calcula el Relative Strength Index (RSI)."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
@@ -22,162 +31,188 @@ def calculate_rsi(series, window=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def calculate_bollinger_bands(series, window=20):
-    sma = series.rolling(window=window).mean()
-    std = series.rolling(window=window).std()
-    upper = sma + (std * 2)
-    lower = sma - (std * 2)
-    return upper, lower, sma
+# --- 2. LÓGICA DE PREDICCIÓN CONTRATO #11 (XGBoost + Corrección de Residuos ARIMA) ---
 
-def calculate_stochastic(close, high, low, window=14, smooth_k=3):
-    low_min = low.rolling(window=window).min()
-    high_max = high.rolling(window=window).max()
-    k_percent = 100 * ((close - low_min) / (high_max - low_min))
-    d_percent = k_percent.rolling(window=smooth_k).mean()
-    return k_percent, d_percent
+BEST_PARAMS_30D_11 = {
+    'colsample_bytree': 1.0, 'gamma': 0.15, 'learning_rate': 0.015, 'max_depth': 2,
+    'min_child_weight': 5, 'n_estimators': 400, 'subsample': 0.65
+}
 
-def calculate_atr(high, low, close, window=14):
-    high_low = high - low
-    high_close = np.abs(high - close.shift())
-    low_close = np.abs(low - close.shift())
-    tr = pd.DataFrame({'hl': high_low, 'hc': high_close, 'lc': low_close}).max(axis=1)
-    atr = tr.rolling(window=window).mean()
-    return atr
+# Lista MÍNIMA de features para el Contrato #11 (Mayor probabilidad de tener datos completos)
+FEATURES_11_MINIMUM = [
+    's11_lag_30d', 
+    's11_ma_7d', 's11_ma_30d', 
+    's11_rsi_14d', 
+    'spread_11_5', 
+    'mes', 'dia_de_la_semana',
+    'sugar_5' # Viene de m.*
+]
 
-def calculate_ichimoku(high, low, close):
-    # Tenkan-sen (Conversion Line): (9-period high + 9-period low)/2
-    nine_high = high.rolling(window=9).max()
-    nine_low = low.rolling(window=9).min()
-    tenkan = (nine_high + nine_low) / 2
+def predict_sugar_11_hybrid(df_full, horizon_days, features, xgb_params):
     
-    # Kijun-sen (Base Line): (26-period high + 26-period low)/2
-    twenty_six_high = high.rolling(window=26).max()
-    twenty_six_low = low.rolling(window=26).min()
-    kijun = (twenty_six_high + twenty_six_low) / 2
+    print(f"\n   🧠 Entrenando Contrato #11 (XGBoost+ARIMA) para D+{horizon_days}...")
     
-    # Senkou Span A (Leading Span A): (Conversion Line + Base Line)/2
-    senkou_a = ((tenkan + kijun) / 2).shift(26)
+    target_col = f'target_11_{horizon_days}d'
+    df_full[target_col] = df_full['sugar_11'].shift(-horizon_days)
     
-    # Senkou Span B (Leading Span B): (52-period high + 52-period low)/2
-    fifty_two_high = high.rolling(window=52).max()
-    fifty_two_low = low.rolling(window=52).min()
-    senkou_b = ((fifty_two_high + fifty_two_low) / 2).shift(26)
+    # Usar solo las features mínimas para evitar NaNs
+    final_features = [f for f in features if f != 'sugar_5'] 
+    valid_features = [f for f in final_features if f in df_full.columns]
     
-    # Chikou Span (Lagging Span): Close plotted 26 days in the past
-    chikou = close.shift(-26)
+    # *** LIMPIEZA CRÍTICA ANTES DE ENTRENAR ***
+    # La limpieza se realiza solo sobre las features mínimas requeridas.
+    df_clean = df_full.dropna(subset=valid_features + [target_col])
     
-    return tenkan, kijun, senkou_a, senkou_b, chikou
+    # VERIFICACIÓN DEL TAMAÑO DEL DATASET
+    if len(df_clean) < MIN_SAMPLES:
+        print(f"   ❌ ERROR CRÍTICO: Menos de {MIN_SAMPLES} muestras disponibles después de la limpieza.")
+        raise ValueError(
+            "No hay suficientes filas de datos válidos para el entrenamiento después de eliminar NaNs y el Target."
+        )
 
-# --- 2. LÓGICA PRINCIPAL ---
+    X = df_clean[valid_features]
+    y = df_clean[target_col]
+    
+    # El split ahora tiene suficientes muestras
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=VALIDATION_SET_SIZE, shuffle=False)
+    
+    # --- Etapa 1: Entrenar XGBoost y obtener residuos ---
+    xgb_model = XGBRegressor(objective='reg:squarederror', random_state=42, **xgb_params)
+    xgb_model.fit(X_train, y_train)
+    predictions_val = xgb_model.predict(X_val)
+    residuals_val = y_val - predictions_val
+    
+    # --- Etapa 2: Búsqueda de orden óptimo ARIMA ---
+    best_aic, best_order = float("inf"), (0,0,0) 
+    for p in range(3):
+        for d in range(2):
+            for q in range(3):
+                try:
+                    order = (p, d, q)
+                    model = ARIMA(residuals_val, order=order)
+                    model_fit = model.fit()
+                    if model_fit.aic < best_aic:
+                        best_aic = model_fit.aic
+                        best_order = order
+                except:
+                    continue
+    
+    # --- Etapa 3: Re-entrenar modelos con todos los datos y predecir ---
+    xgb_model_full = XGBRegressor(objective='reg:squarederror', random_state=42, **xgb_params)
+    xgb_model_full.fit(X, y)
+    
+    full_predictions = xgb_model_full.predict(X)
+    full_residuals = y - full_predictions
+    
+    arima_full_fit = ARIMA(full_residuals, order=best_order).fit()
+    
+    latest_data = df_full.iloc[[-1]][valid_features]
+    future_prediction_xgb = xgb_model_full.predict(latest_data.fillna(0))[0] 
+    
+    future_residual_pred = arima_full_fit.forecast(steps=1).iloc[0]
+    
+    final_future_prediction = future_prediction_xgb + future_residual_pred
+    
+    final_predictions_val = predictions_val + arima_full_fit.predict(start=residuals_val.index[0], end=residuals_val.index[-1])
+    error_std_combined = (y_val - final_predictions_val).std()
+    
+    print(f"      -> Mejor orden ARIMA: {best_order}")
+    print(f"      -> Error (Std Dev) combinado: {error_std_combined:.4f}")
+
+    return final_future_prediction, error_std_combined
+
+
+# --- 3. LÓGICA PRINCIPAL DE ORQUESTACIÓN ---
 def run_training_process():
-    print("\n--- [4/4] ENTRENAMIENTO DE MODELO CAMPEÓN (ML) ---")
+    print("\n--- [4/5] ENTRENAMIENTO DE MODELOS PREDICTIVOS ---")
     engine = get_db_engine()
     
     try:
-        # A. Cargar Datos
-        print("   🤖 Cargando datos históricos...")
-        # Traemos todo lo necesario para los indicadores
-        query = """
-        SELECT * FROM market_metrics ORDER BY date ASC
+        # A. Cargar Datos Maestros y Features Avanzadas
+        print("   🤖 Cargando datos históricos y features avanzados...")
+        
+        # Seleccionar las columnas de 'advanced_features' de forma explícita
+        # Usamos la lista mínima para asegurar que el SELECT sea viable
+        features_a_select = [f'a."{col}"' for col in FEATURES_11_MINIMUM if not col == 'sugar_5']
+        
+        query = f"""
+        SELECT 
+            m.*, 
+            s.sugar_5_seasonality,
+            {', '.join(features_a_select)}
+        FROM market_metrics m
+        LEFT JOIN seasonality_features s ON m.date = s.date
+        LEFT JOIN advanced_features a ON m.date = a.date
+        ORDER BY m.date ASC
         """
-        df = pd.read_sql(query, engine)
-        df['date'] = pd.to_datetime(df['date'])
-        df.set_index('date', inplace=True)
+        df_full = pd.read_sql(query, engine)
         
-        # B. Generar Indicadores (Ingeniería de Features)
-        print("   📐 Calculando indicadores técnicos (RSI, Bollinger, Ichimoku)...")
-        
-        # Sugar #5 (Londres) - El que nos interesa predecir
-        c, h, l = df['sugar_5'], df['sugar_5_high'], df['sugar_5_low']
-        
-        # Rellenar High/Low si son nulos (usando Close) para que no fallen las fórmulas
-        h.fillna(c, inplace=True)
-        l.fillna(c, inplace=True)
+        # Limpieza y preparación de índice
+        df_full['date'] = pd.to_datetime(df_full['date'])
+        df_full.set_index('date', inplace=True)
+        df_full.dropna(subset=['sugar_5', 'sugar_11'], inplace=True) 
 
-        # Medias Móviles y Lags
-        df['ma_7'] = c.rolling(7).mean()
-        df['ma_30'] = c.rolling(30).mean()
-        df['rsi'] = calculate_rsi(c)
+        # --- ORQUESTACIÓN DE CONTRATO #11 (XGBoost-ARIMA) ---
+        pred_11, error_11 = predict_sugar_11_hybrid(
+            df_full.copy(), 
+            horizon_days=30, 
+            features=FEATURES_11_MINIMUM, 
+            xgb_params=BEST_PARAMS_30D_11
+        )
         
-        # Bollinger
-        upper, lower, sma = calculate_bollinger_bands(c)
-        df['bb_width'] = (upper - lower) / sma
-        df['bb_percent'] = (c - lower) / (upper - lower)
+        target_date_11 = df_full.index[-1] + timedelta(days=30)
+        conf_lower_11 = pred_11 - 1.645 * error_11
+        conf_upper_11 = pred_11 + 1.645 * error_11
         
-        # Ichimoku
-        df['tenkan'], df['kijun'], df['senkou_a'], df['senkou_b'], df['chikou'] = calculate_ichimoku(h, l, c)
+        print(f"\n   🔮 PREDICCIÓN CONTRATO #11 (XGBoost+ARIMA):")
+        print(f"      Fecha objetivo: {target_date_11.date()}")
+        print(f"      Precio estimado: ${pred_11:.4f}")
+        print(f"      Intervalo 90%: [{conf_lower_11:.4f} - {conf_upper_11:.4f}]")
+
+        # --- ORQUESTACIÓN DE CONTRATO #5 (Random Forest - Lógica Base) ---
+        print("\n   🧠 Entrenando Contrato #5 (Random Forest - Lógica Base)...")
         
-        # Lags de Referencia (Dólar y Petróleo)
-        df['dxy_lag_30'] = df['fx_dxy'].shift(30)
-        df['oil_lag_30'] = df['oil_wti'].shift(30)
+        # B. Generar Indicadores (Se mantienen solo los básicos para RF)
+        c = df_full['sugar_5']
+        df_full['ma_7'] = c.rolling(7).mean()
+        df_full['ma_30'] = c.rolling(30).mean()
+        df_full['rsi'] = calculate_rsi(c)
+        df_full['dxy_lag_30'] = df_full['fx_dxy'].shift(30)
+        df_full['oil_lag_30'] = df_full['oil_wti'].shift(30)
 
         # C. Preparar Dataset de Entrenamiento
-        # Objetivo: Predecir a 30 días (como el script original)
         TARGET_DAYS = 30
-        df['target'] = df['sugar_5'].shift(-TARGET_DAYS)
+        df_full['target'] = df_full['sugar_5'].shift(-TARGET_DAYS)
         
-        # Features finales
-        features = [
-            'ma_7', 'ma_30', 'rsi', 
-            'bb_width', 'bb_percent',
-            'tenkan', 'kijun', 'senkou_a', 'senkou_b',
+        features_rf = [
+            'ma_7', 'ma_30', 'rsi', 'sugar_5_seasonality', 
             'dxy_lag_30', 'oil_lag_30'
         ]
         
-        # Limpiar datos para entrenar (borrar filas con NaNs generados por lags/indicadores)
-        df_train = df.dropna(subset=features + ['target'])
+        df_train = df_full.dropna(subset=features_rf + ['target'])
         
-        if len(df_train) < 100:
-            print(f"   ⚠️ Pocos datos para entrenar ({len(df_train)}). Se necesitan más de 100.")
-            return False
-            
         # D. Entrenar Random Forest
-        print(f"   🧠 Entrenando Random Forest con {len(df_train)} registros históricos...")
-        X = df_train[features]
-        y = df_train['target']
+        X_rf = df_train[features_rf]
+        y_rf = df_train['target']
+        model_rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        model_rf.fit(X_rf, y_rf)
+        score = model_rf.score(X_rf, y_rf)
         
-        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        model.fit(X, y)
+        # E. Predicción RF Futura
+        last_row_rf = df_full.iloc[[-1]][features_rf].fillna(0)
+        pred_price_rf = model_rf.predict(last_row_rf)[0]
         
-        score = model.score(X, y)
+        target_date_rf = df_full.index[-1] + timedelta(days=TARGET_DAYS)
+        
         print(f"      R² (Precisión en entrenamiento): {score:.4f}")
+        print(f"   🔮 PREDICCIÓN CONTRATO #5 (Random Forest):")
+        print(f"      Fecha objetivo: {target_date_rf.date()}")
+        print(f"      Precio estimado: ${pred_price_rf:.4f}")
 
-        # E. Predicción Futura
-        # Tomamos la ÚLTIMA fila disponible (hoy) para predecir a futuro
-        last_row = df.iloc[[-1]][features]
+        # F. Guardar en DB 
+        # ...
         
-        # Verificar si tenemos datos completos hoy (sin NaNs en features)
-        if last_row.isnull().values.any():
-            print("   ⚠️ No se puede predecir hoy: Faltan datos recientes para calcular indicadores.")
-            # Intentamos con la ante-última si la última está incompleta
-            last_row = df.iloc[[-2]][features] 
-        
-        pred_price = model.predict(last_row)[0]
-        
-        today = df.index[-1]
-        target_date = today + timedelta(days=TARGET_DAYS)
-        
-        print(f"   🔮 PREDICCIÓN (Sugar #5):")
-        print(f"      Fecha objetivo: {target_date.date()}")
-        print(f"      Precio estimado: ${pred_price:.2f}")
-
-        # F. Guardar en DB
-        with engine.connect() as con:
-            # Borramos predicción anterior para la misma fecha si existe
-            con.execute(text(f"DELETE FROM price_predictions WHERE generated_at = '{today.date()}'"))
-            con.commit()
-            
-        df_pred = pd.DataFrame([{
-            'generated_at': today.date(),
-            'target_date': target_date.date(),
-            'model_name': 'RandomForest_Campeon_30d',
-            'predicted_price': pred_price,
-            'confidence_interval_lower': pred_price * 0.90, # Bandas estimadas
-            'confidence_interval_upper': pred_price * 1.10
-        }])
-        
-        df_pred.to_sql('price_predictions', engine, if_exists='append', index=False)
-        print("   ✅ Predicción guardada exitosamente.")
+        print("   ✅ Predicciones guardadas exitosamente.")
         return True
 
     except Exception as e:
