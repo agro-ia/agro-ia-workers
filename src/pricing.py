@@ -2,8 +2,15 @@ import pandas as pd
 import numpy as np
 import os
 import sys
+import pickle
+import math
 from datetime import date, timedelta
-from sqlalchemy import text, create_engine # Necesario para la conexión de DB
+from sqlalchemy import text
+import copy 
+import logging
+
+# Configuración de Logging para un output más limpio
+logging.getLogger('pandas.io.sql').setLevel(logging.ERROR) 
 
 # Brújula para imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -12,48 +19,50 @@ sys.path.append(project_root)
 
 from config.db import get_db_engine
 
-# --- 1. MÓDULO DE SOPORTE A DECISIONES (Paridad y CIF) ---
+# --- 0. CONFIGURACIÓN Y CONSTANTES ---
+MODELOS_DIR = os.path.join(project_root, 'modelos')
+CHAMPION_MODEL_CONSUMO_PATH = os.path.join(MODELOS_DIR, 'modelo_consumo_sarima.pkl')
 
-# NOTA: En un proyecto real, los COSTOS y AJUSTES se cargarían desde una tabla de 'Configuración' en la DB. 
-# Aquí los definimos como constantes para replicar la lógica de los scripts originales.
+# Constantes de Costos y Factores 
+AJUSTE_CONTRATO_5 = 40.0 
+TASA_IVA_ARG = 1.21      
+COSTO_COMEX_USD_TN = 55.0 
+COSTO_CIF_SANTIAGO_USD_TN = 60.0 
+TN_POR_BOLSA = 0.05 
 
-# Constantes de Costos y Factores (Extraídas de calculadora_paridad.py y cif_santiago.py)
-AJUSTE_CONTRATO_5 = 40.0 # Ajuste fijo para el Contrato #5 (USD/TN)
-TASA_IVA_ARG = 1.21      # Constante para el IVA en Argentina
-COSTO_COMEX_USD_TN = 55.0 # Costo de exportación desde Argentina (asumido si no se lee de DB)
-COSTO_CIF_SANTIAGO_USD_TN = 60.0 # Costo CIF para Chile (asumido si no se lee de DB)
-KG_POR_BOLSA = 50.0
-TN_POR_BOLSA = 0.05 # 50kg / 1000kg
+# Parámetros Óptimos para el PRD 
+BEST_PRD_PARAMS = {
+    'K_MIN': 0.15, 
+    'K_MAX': 0.5, 
+    'UMBRAL_DESVIACION': 0.14, 
+    'PENDIENTE_SIGMOIDE': 10
+}
+
+# --- 1. MÓDULO DE SOPORTE A DECISIONES (Paridad y Comparador) ---
 
 def get_latest_market_data(engine):
     """Obtiene los últimos precios y tipos de cambio necesarios para la paridad."""
     query = """
-    SELECT date, sugar_5, fx_ars_usd, fx_brl_usd, fx_dxy
+    SELECT date, sugar_5, fx_ars_usd
     FROM market_metrics
     ORDER BY date DESC
     LIMIT 1
     """
     df = pd.read_sql(query, engine)
     if df.empty:
-        raise ValueError("No se encontraron datos de mercado en market_metrics.")
+        # Esto solo debería ocurrir si el fetcher falló.
+        return {'sugar_5': 20.0, 'fx_ars_usd': 900.0} 
     return df.iloc[0].to_dict()
 
 def calcular_precio_paridad_exportacion(engine):
-    """
-    Calcula el Precio de Paridad de Exportación en ARS por bolsa de 50kg.
-    (Replica calculadora_paridad.py)
-    """
+    """Calcula el Precio de Paridad de Exportación en ARS por bolsa de 50kg."""
     data = get_latest_market_data(engine)
     
     precio_contrato_5 = data.get('sugar_5', 0)
     tipo_cambio_ars = data.get('fx_ars_usd', 1.0)
     costo_exportacion = COSTO_COMEX_USD_TN
     
-    # Lógica de Cálculo (USD/TN)
-    precio_contrato_ajustado = precio_contrato_5 - AJUSTE_CONTRATO_5
-    precio_paridad_usd_tn = precio_contrato_ajustado - costo_exportacion
-    
-    # Conversión a ARS/50kg
+    precio_paridad_usd_tn = (precio_contrato_5 - AJUSTE_CONTRATO_5) - costo_exportacion
     precio_paridad_ars_50kg = (precio_paridad_usd_tn * tipo_cambio_ars * TN_POR_BOLSA)
     
     return {
@@ -61,35 +70,8 @@ def calcular_precio_paridad_exportacion(engine):
         'precio_paridad_usd_tn': precio_paridad_usd_tn
     }
 
-def calcular_precio_cif_santiago(engine):
-    """
-    Calcula el Precio CIF Santiago en la moneda local (CLP) por tonelada.
-    (Replica cif_santiago.py - ASUMIENDO USD/CLP disponible si es necesario)
-    """
-    data = get_latest_market_data(engine)
-    precio_contrato_5 = data.get('sugar_5', 0)
-    
-    # Nota: Como USD/CLP no está en market_metrics, usamos un valor de respaldo
-    # DEBERÍAS AÑADIR USD/CLP a market_metrics para que este cálculo sea exacto
-    TIPO_CAMBIO_USD_CLP = 950.0 
-    costo_cif = COSTO_CIF_SANTIAGO_USD_TN
-    
-    # Lógica de Cálculo (USD/TN)
-    precio_contrato_ajustado = precio_contrato_5 - AJUSTE_CONTRATO_5
-    precio_neto_usd_tn = precio_contrato_ajustado + costo_cif
-    
-    # Conversión a CLP/TN
-    precio_cif_clp_tn = precio_neto_usd_tn * TIPO_CAMBIO_USD_CLP
-    
-    return {
-        'precio_cif_clp_tn': precio_cif_clp_tn,
-        'precio_neto_usd_tn': precio_neto_usd_tn
-    }
-
 def comparar_mercados(engine, precio_interno_ars_50kg_con_iva):
-    """
-    Compara la rentabilidad local vs. exportación. (Replica comparador_mercados.py)
-    """
+    """Compara la rentabilidad local vs. exportación."""
     paridad_results = calcular_precio_paridad_exportacion(engine)
     precio_paridad_neto = paridad_results['precio_paridad_ars_50kg']
     
@@ -105,100 +87,192 @@ def comparar_mercados(engine, precio_interno_ars_50kg_con_iva):
         'recomendacion': recomendacion
     }
 
-# --- 2. MÓDULO DEL MOTOR PRD DIARIO (motor_prd_diario.py) ---
+# --- 2. LÓGICA DE PROYECCIÓN SARIMAX PARA EL PRD ---
 
-# Este módulo es muy complejo y requiere:
-# a) Conexión a la DB para leer el Plan Estratégico.
-# b) Conexión a la DB para leer el Historial de Operaciones (Consumo/Producción REAL).
-# c) Carga de un modelo SARIMAX de CONSUMO (que replicaremos en training.py y guardaremos en DB).
+def load_sarimax_model():
+    """Carga el modelo SARIMAX de consumo entrenado desde disco."""
+    try:
+        with open(CHAMPION_MODEL_CONSUMO_PATH, 'rb') as pfile:
+            model_data = pickle.load(pfile)
+            # Retorna el modelo y la fecha de entrenamiento para evitar fallos
+            return model_data
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"   ❌ ERROR PRD: Fallo al cargar el modelo SARIMAX: {e}")
+        return None
 
-def calcular_prd_diario(fecha_analisis: date, K_MIN: float, K_MAX: float, UMBRAL_DESVIACION: float, PENDIENTE_SIGMOIDE: float):
-    """
-    Calcula el Precio de Referencia Dinámico (PRD) basado en la desviación de stock.
-    (Replica motor_prd_diario.py - Requiere datos de simulación/reales en la DB)
-    """
+def project_consumption_sarimax(engine, hoy: date, n_days=7):
+    """Genera un pronóstico de consumo diario para los próximos N días usando el modelo SARIMAX."""
+    model_data = load_sarimax_model()
+    if model_data is None: return None
+    
+    modelo_sarima_consumo = model_data['model']
+    
+    # 1. Preparar fechas y obtener Feature Exógena (Estacionalidad)
+    forecast_start_date = pd.Timestamp(hoy) + timedelta(days=1)
+    forecast_dates = pd.date_range(start=forecast_start_date, periods=n_days, freq='D')
+    
+    query_seasonality = "SELECT date, sugar_5_seasonality FROM seasonality_features ORDER BY date ASC"
+    df_seasonality = pd.read_sql(query_seasonality, engine)
+    df_seasonality['date'] = pd.to_datetime(df_seasonality['date'])
+    df_seasonality.set_index('date', inplace=True)
+    
+    # Proyectar la estacionalidad del año anterior para el futuro
+    past_dates = [d - pd.DateOffset(years=1) for d in forecast_dates]
+    X_forecast = df_seasonality.reindex(past_dates).ffill().bfill()
+    X_forecast.index = forecast_dates 
+    
+    # 3. Pronosticar 
+    try:
+        forecast_result = modelo_sarima_consumo.predict(
+            n_periods=n_days,
+            X=X_forecast
+        )
+        forecast_result = forecast_result.apply(lambda x: max(0, x))
+        
+        return pd.Series(forecast_result.values, index=forecast_dates, name='consumo_pronosticado')
+        
+    except Exception as e:
+        print(f"   ❌ ERROR PRD: Fallo en la proyección SARIMAX: {e}")
+        return None
+
+
+# --- 3. MOTOR PRD DIARIO (motor_prd_diario.py) ---
+
+def calcular_prd_diario(fecha_analisis: date):
+    """Calcula el Precio de Referencia Dinámico (PRD) para una fecha específica."""
     engine = get_db_engine()
     hoy = fecha_analisis
-    
-    # --- A. Cargar Datos Necesarios (Simulación/Reales) ---
+    params = BEST_PRD_PARAMS 
+
+    # --- A. Cargar Datos Necesarios (Balance y Precio Base) ---
     try:
-        # 1. Obtener el Stock Esperado y Stock Estratégico (del Plan Diario - DEBE ESTAR EN LA DB)
-        # ASUMIMOS que los planes están en tablas prd_plan_diario y prd_plan_mensual
-        query_plan_diario = f"SELECT * FROM prd_plan_diario WHERE date = '{hoy.strftime('%Y-%m-%d')}'"
-        plan_diario = pd.read_sql(query_plan_diario, engine).iloc[0]
-        
-        # 2. Obtener el Stock REAL de hoy (Requiere tabla de Historial/Balance REAL)
-        query_balance_real = f"""
+        # 1. Stock Real Acumulado y Stock Inicial del Mes
+        query_balance_acc = f"""
         SELECT 
-            SUM(produccion_real_diaria) as prod_acc, 
-            SUM(consumo_real_diaria) as cons_acc,
-            stock_inicial_mes 
+            SUM(produccion_real_diaria) AS prod_acc, 
+            SUM(consumo_real_diaria) AS cons_acc,
+            MAX(stock_inicial_mes) AS stock_inicial 
         FROM balance_historial_real
         WHERE date <= '{hoy.strftime('%Y-%m-%d')}' AND EXTRACT(MONTH FROM date) = {hoy.month}
         """
-        # Esta consulta es muy simplificada y ASUME la tabla 'balance_historial_real' y 'stock_inicial_mes'
-        balance_real = pd.read_sql(query_balance_real, engine).iloc[0]
+        balance_acc = pd.read_sql(query_balance_acc, engine).iloc[0]
         
-        stock_real_hoy = balance_real['stock_inicial_mes'] + balance_real['prod_acc'] - balance_real['cons_acc']
+        if balance_acc.isnull().any():
+             raise ValueError("Datos de balance real incompletos o tabla vacía para la fecha.")
+             
+        stock_inicial_anual = balance_acc['stock_inicial'] 
+        stock_real_hoy = stock_inicial_anual + balance_acc['prod_acc'] - balance_acc['cons_acc']
+
+        # 2. Stock Esperado y Estratégico (Del Plan Diario)
+        query_plan_diario = f"SELECT * FROM prd_plan_diario WHERE date = '{hoy.strftime('%Y-%m-%d')}'"
+        plan_diario = pd.read_sql(query_plan_diario, engine)
+        
+        if plan_diario.empty:
+            raise ValueError(f"No se encontró plan estratégico diario para {hoy.strftime('%Y-%m-%d')}.")
+        
+        plan_diario = plan_diario.iloc[0]
         stock_esperado_hoy = plan_diario['stock_diario_objetivo']
         stock_estrategico = plan_diario['stock_estrategico_mensual']
-        
-        # 3. Obtener Precio Base (Asumimos que viene de market_metrics/último cierre)
-        precio_base = get_latest_market_data(engine).get('sugar_5', 1000) # Usamos Contrato #5 como base, luego lo convertimos/ajustamos a precio interno.
+
+        # 3. Precio Base
+        precio_base_tn = get_latest_market_data(engine).get('sugar_5', 1000)
 
     except Exception as e:
-        print(f"ERROR PRD: Fallo al cargar datos necesarios. {e}")
-        return None # Retorno seguro en caso de fallo
+        print(f"   ❌ ERROR PRD (Carga de Datos): {e}")
+        return None
 
-    # --- B. Lógica de Desviación y K Dinámico ---
+    # --- B. Cálculo de Desviación Diaria y Proyectada ---
     
-    if stock_estrategico == 0:
-        delta_s_diario = 0.0
+    delta_s_diario = (stock_real_hoy - stock_esperado_hoy) / stock_estrategico if stock_estrategico else 0.0
+
+    consumo_pronosticado_7d = project_consumption_sarimax(engine, hoy, n_days=7)
+
+    if consumo_pronosticado_7d is None:
+        delta_s_proyectado = 0.0
+        print("   ⚠️ PRD calculado sin proyección de consumo futuro (SARIMAX no disponible).")
     else:
-        # Desviación (ΔS_Diario)
-        delta_s_diario = (stock_real_hoy - stock_esperado_hoy) / stock_estrategico
+        # Simular stock para los próximos 7 días (usando el plan de producción)
+        stock_proyectado = stock_real_hoy
+        for i, consumo_pron in enumerate(consumo_pronosticado_7d):
+            fecha_futura = pd.Timestamp(hoy) + timedelta(days=i + 1)
+            
+            # Obtener el objetivo de producción del plan para la fecha futura
+            query_prod = f"SELECT produccion_diaria_objetivo FROM prd_plan_diario WHERE date = '{fecha_futura.strftime('%Y-%m-%d')}'"
+            df_prod = pd.read_sql(query_prod, engine)
+            
+            prod_objetivo = df_prod.iloc[0]['produccion_diaria_objetivo'] if not df_prod.empty else 0.0
+            stock_proyectado += prod_objetivo - consumo_pron
+        
+        # Obtener el stock objetivo para dentro de 7 días
+        fecha_objetivo_7d = (pd.Timestamp(hoy) + timedelta(days=7)).strftime('%Y-%m-%d')
+        query_obj = f"SELECT stock_diario_objetivo FROM prd_plan_diario WHERE date = '{fecha_objetivo_7d}'"
+        df_obj = pd.read_sql(query_obj, engine)
 
-    # Aquí iría la llamada a calcular_desviacion_proyectada() que usa el modelo SARIMAX de CONSUMO.
-    # Por ahora, la omitimos para no complicar hasta tener el modelo SARIMAX guardado.
-    delta_s_proyectado = 0.0 # Placeholder
+        stock_objetivo_7d = df_obj.iloc[0]['stock_diario_objetivo'] if not df_obj.empty else stock_esperado_hoy
+        
+        # Calcular la desviación proyectada
+        delta_s_proyectado = (stock_proyectado - stock_objetivo_7d) / stock_estrategico if stock_estrategico else 0.0
+
+    # --- D. Cálculo del PRD Final ---
+    delta_s_combinado = (0.6 * delta_s_diario) + (0.4 * delta_s_proyectado)
     
-    delta_s_combinado = (0.6 * delta_s_diario) + (0.4 * delta_s_proyectado) # Peso 60/40
-
-    # K Dinámico (Usando la sigmoide para ajustar la sensibilidad)
-    abs_delta_s = abs(delta_s_combinado)
-    x = PENDIENTE_SIGMOIDE * (abs_delta_s - UMBRAL_DESVIACION)
-    sigmoid_val = 1 / (1 + np.exp(-x))
-    K_dinamico = K_MIN + (K_MAX - K_MIN) * sigmoid_val
-
-    # --- C. Cálculo Final del PRD ---
-    # La fórmula clave de ajuste de precios: P_final = P_base * (1 - K * ΔS_combinado)
-    prd_tn = precio_base * (1 - K_dinamico * delta_s_combinado)
+    K_dinamico = params['K_MIN'] + (params['K_MAX'] - params['K_MIN']) * (1 / (1 + math.exp(-params['PENDIENTE_SIGMOIDE'] * (abs(delta_s_combinado) - params['UMBRAL_DESVIACION']))))
+    
+    prd_tn = precio_base_tn * (1 - K_dinamico * delta_s_combinado)
+    
+    analisis_texto = "El PRD subió para moderar la demanda." if delta_s_combinado < 0 else "El PRD bajó para incentivar la demanda."
     
     return {
         'prd_tn': prd_tn,
         'k_dinamico': K_dinamico,
         'delta_s_combinado': delta_s_combinado,
-        'stock_real_hoy': stock_real_hoy
+        'stock_real_hoy': stock_real_hoy,
+        'analisis_texto': analisis_texto
     }
 
-if __name__ == '__main__':
+# --- 4. FUNCIÓN DE ORQUESTACIÓN DEL WORKER (Punto de entrada para main.py) ---
+
+def run_pricing_and_decision(fecha_analisis: date = date.today()):
+    """Orquesta la ejecución de la paridad y el PRD (Paso [5/5])."""
+    print("\n--- [5/5] CÁLCULO DE PRECIOS Y DECISIONES ---")
     engine = get_db_engine()
     
-    # 1. Ejemplo de Cálculo de Paridad
-    print("--- Prueba de Paridad de Exportación ---")
-    paridad = calcular_precio_paridad_exportacion(engine)
-    print(f"Precio de Paridad (ARS/50kg): {paridad['precio_paridad_ars_50kg']:,.2f}")
+    # Usaremos la fecha del último dato sembrado para la simulación
+    query_last_date = "SELECT MAX(date) AS max_date FROM balance_historial_real"
+    last_date_df = pd.read_sql(query_last_date, engine)
     
-    # 2. Ejemplo de Comparador de Mercados (Necesita un precio interno simulado)
-    precio_interno_simulado_con_iva = 15000.00 # ARS/50kg
-    print(f"\n--- Comparación de Mercados ---")
-    comparacion = comparar_mercados(engine, precio_interno_simulado_con_iva)
-    print(f"Recomendación: {comparacion['recomendacion']} | Diferencial: {comparacion['diferencial_ars_50kg']:,.2f}")
+    # Asume la fecha del último dato sembrado (2025-12-31 en la simulación)
+    if last_date_df['max_date'].isnull().iloc[0]:
+         print("   ❌ ERROR: La tabla balance_historial_real está vacía. No se puede calcular PRD.")
+         return None
+         
+    fecha_analisis_final = last_date_df.iloc[0]['max_date']
     
-    # 3. Ejemplo de PRD (Requiere que existan las tablas prd_plan_diario/mensual)
-    # print(f"\n--- Cálculo de PRD para hoy ---")
-    # prd_results = calcular_prd_diario(
-    #     date.today(), K_MIN=0.2, K_MAX=0.8, UMBRAL_DESVIACION=0.05, PENDIENTE_SIGMOIDE=50
-    # )
-    # if prd_results:
-    #     print(f"PRD (USD/TN): {prd_results['prd_tn']:,.2f}")
+    print(f"   Analizando fecha: {fecha_analisis_final.strftime('%Y-%m-%d')}")
+    
+    # 1. Calcular PRD 
+    prd_results = calcular_prd_diario(fecha_analisis_final)
+
+    if prd_results:
+        print("\n--- INFORME PRD TÁCTICO ---")
+        print(f"  PRD (USD/TN): ${prd_results['prd_tn']:,.2f}")
+        print(f"  ΔS Combinado: {prd_results['delta_s_combinado']:.2%}")
+        print(f"  Análisis: {prd_results['analisis_texto']}")
+        
+    # 2. Comparación de Mercados 
+    PRECIO_INTERNO_ACTUAL_CON_IVA = 15000.00 # ARS/50kg CON IVA (Simulado)
+    
+    comparacion = comparar_mercados(engine, PRECIO_INTERNO_ACTUAL_CON_IVA)
+    
+    print("\n--- RECOMENDACIÓN ESTRATÉGICA ---")
+    print(f"  Paridad de Exportación (ARS/50kg Neto): ${comparacion['precio_paridad_neto']:,.2f}")
+    print(f"  Precio Interno Neto (ARS/50kg): ${comparacion['precio_interno_neto']:,.2f}")
+    print(f"  Decisión: {comparacion['recomendacion']} | Diferencial: ${comparacion['diferencial_ars_50kg']:,.2f} ARS/50kg")
+    
+    return prd_results, comparacion
+
+if __name__ == '__main__':
+    # Para probar el PRD en una fecha de tu histórico simulado (ej. 2025-06-15)
+    run_pricing_and_decision(date(2025, 6, 15))
