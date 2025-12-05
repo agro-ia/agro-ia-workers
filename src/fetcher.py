@@ -22,10 +22,10 @@ ACTIVOS = [
     
     # GAS
     {'ticker': 'Natural Gas', 'tipo': 'commodity', 'nombre_investpy': 'Natural Gas', 'pais': 'united states'},
-    {'ticker': 'Dutch TTF Gas', 'tipo': 'commodity', 'nombre_investpy': 'Dutch TTF Natural Gas Futures', 'pais': 'netherlands'},
+    # {'ticker': 'Dutch TTF Gas', 'tipo': 'commodity', 'nombre_investpy': 'Dutch TTF Natural Gas Futures', 'pais': 'netherlands'},
     
     # ETANOL
-    {'ticker': 'Ethanol Futures', 'tipo': 'commodity', 'nombre_investpy': 'Ethanol', 'pais': 'united states'}
+    # {'ticker': 'Ethanol Futures', 'tipo': 'commodity', 'nombre_investpy': 'Ethanol', 'pais': 'united states'}
 ]
 
 def obtener_datos(activo, fecha_inicio):

@@ -18,7 +18,7 @@ def main():
     if not run_balance_seeder(): sys.exit(1)
     run_fetch_process()
     if not run_dataset_creation(): sys.exit(1)
-    if not run_feature_engineering(): sys.exit(1)
+    if not run_feature_engineering(): sys.exit(1)    
 
     # 6. Entrenar Modelo (Retorna una LISTA de predicciones)
     predictions_list = run_training_process()

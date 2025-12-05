@@ -51,12 +51,6 @@ def save_predictions_to_db(engine, predictions_list: list, pricing_results: tupl
     df_final = pd.DataFrame(rows_to_insert)
     
     try:
-        # Borrar predicciones anteriores para estas fechas específicas para evitar duplicados
-        fechas = "', '".join([d['date'].strftime('%Y-%m-%d') for d in predictions_list])
-        with engine.connect() as con:
-            con.execute(text(f"DELETE FROM final_predictions WHERE date IN ('{fechas}')"))
-            con.commit()
-            
         df_final.to_sql('final_predictions', engine, if_exists='append', index=False)
         print(f"   ✅ Se guardaron {len(df_final)} filas de predicción (Horizontes 1-7, 30).")
         return True
