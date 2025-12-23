@@ -35,7 +35,7 @@ jobs:
           push: true
           platforms: linux/arm64
           tags: |            
-            ghcr.io/agro-ia/agro-ia-workers:prod-${{ steps.short-sha.outputs.sha }}
+            ghcr.io/agro-ia/agro-ia-workers:prod-${{ github.sha }}
 
           build-args: |
             ACTOR=${{ github.repository_owner }}
@@ -84,7 +84,7 @@ jobs:
           push: true
           platforms: linux/arm64
           tags: |
-            ghcr.io/agro-ia/agro-ia-workers:qa-${{ steps.short-sha.outputs.sha }}
+            ghcr.io/agro-ia/agro-ia-workers:qa-${{ github.sha }}
 
           build-args: |
             ACTOR=${{ github.repository_owner }}
