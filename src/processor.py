@@ -13,6 +13,8 @@ TICKER_MAP = {
     'Crude Oil WTI': 'oil_wti',
     'Brent Oil': 'oil_brent',
     'Natural Gas': 'natgas_hh',
+    'Dutch TTF Gas': 'natgas_ttf',
+    'Ethanol Futures': 'ethanol',
 }
 
 def run_dataset_creation():
