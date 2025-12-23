@@ -1,0 +1,106 @@
+name: "Continuous Deployment to main"
+on:
+  push:
+    branches:
+      - production
+      - qa
+  workflow_dispatch:
+
+jobs:
+  push_to_registry:
+    if: github.ref == 'refs/heads/production'
+    name: Push Docker image to GitHub Packages (production)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Short SHA
+        uses: benjlevesque/short-sha@v1.2
+        id: short-sha
+        with:
+          length: 8
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GitHub Packages
+        id: docker_build
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          platforms: linux/arm64
+          tags: |            
+            ghcr.io/agro-ia/agro-ia-workers:prod-${{ steps.short-sha.outputs.sha }}
+
+          build-args: |
+            ACTOR=${{ github.repository_owner }}
+            TOKEN=${{ secrets.GITHUB_TOKEN }}
+            ENVIRONMENT=${{ github.ref_name }}
+
+      - name: Update server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/deployer-production
+            echo ${{ secrets.GH_TOKEN }} | docker login ghcr.io -u santiagojerez --password-stdin
+            sed -i "s|ghcr.io/agro-ia/agro-ia-workers:prod-.*|ghcr.io/agro-ia/agro-ia-workers:prod-${{ github.sha }}|g" docker-compose.override.yml
+            docker pull ghcr.io/agro-ia/agro-ia-workers:prod-${{ github.sha }}
+            docker system prune -a --force
+            docker compose up -d agroia-workers-prod
+
+  push_to_registry_qa:
+    if: github.ref == 'refs/heads/qa'
+    name: Push Docker image to GitHub Packages (qa)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Short SHA
+        uses: benjlevesque/short-sha@v1.2
+        id: short-sha
+        with:
+          length: 8
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GH_TOKEN }}
+
+      - name: Push to GitHub Packages
+        id: docker_build
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          platforms: linux/arm64
+          tags: |
+            ghcr.io/agro-ia/agro-ia-workers:qa-${{ steps.short-sha.outputs.sha }}
+
+          build-args: |
+            ACTOR=${{ github.repository_owner }}
+            TOKEN=${{ secrets.GH_TOKEN }}
+            ENVIRONMENT=${{ github.ref_name }}
+
+      - name: Update QA server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/deployer-qa
+            echo ${{ secrets.GH_TOKEN }} | docker login ghcr.io -u santiagojerez --password-stdin
+            sed -i "s|ghcr.io/agro-ia/agro-ia-workers:qa-.*|ghcr.io/agro-ia/agro-ia-workers:qa-${{ github.sha }}|g" docker-compose.override.yml
+            docker pull ghcr.io/agro-ia/agro-ia-workers:qa-${{ github.sha }}
+            docker system prune -a --force
+            docker compose up -d agroia-workers
